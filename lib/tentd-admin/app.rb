@@ -4,25 +4,22 @@ require 'sprockets'
 require 'hashie'
 require 'tentd'
 require 'tent-client'
-require 'rack/csrf'
 require 'slim'
 require 'coffee_script'
 require 'sass'
+require 'securerandom'
 
 module TentD
   class Admin < Sinatra::Base
     require 'tentd-admin/sprockets/environment'
 
     configure do
+      set :assets, SprocketsEnvironment.assets
       set :asset_manifest, Yajl::Parser.parse(File.read(ENV['ADMIN_ASSET_MANIFEST'])) if ENV['ADMIN_ASSET_MANIFEST']
       set :cdn_url, ENV['ADMIN_CDN_URL']
 
       set :method_override, true
     end
-
-    use Rack::Csrf
-
-    include SprocketsEnvironment
 
     helpers do
       def path_prefix
@@ -30,7 +27,7 @@ module TentD
       end
 
       def asset_path(path)
-        path = asset_manifest_path(path) || assets.find_asset(path).digest_path
+        path = asset_manifest_path(path) || settings.assets.find_asset(path).digest_path
         if settings.cdn_url?
           "#{settings.cdn_url}/assets/#{path}"
         else
@@ -48,8 +45,12 @@ module TentD
         "#{path_prefix}/#{path}".gsub(%r{//}, '/')
       end
 
+      def csrf_token
+        session[:csrf_token] ||= SecureRandom.hex
+      end
+
       def csrf_tag
-        Rack::Csrf.tag(env)
+        "<input type='hidden' name='_csrf' value='#{csrf_token}' />"
       end
 
       def method_override(method)
@@ -97,31 +98,57 @@ module TentD
         current if session[:current_user_id] == current.id
       end
 
+      def authenticate_csrf!
+        halt 403 unless params[:_csrf] == session[:csrf_token]
+      end
+
       def authenticate!
         halt 403 unless current_user
       end
+
+      def basic_profile_uri
+        'https://tent.io/types/info/basic/v0.1.0'
+      end
     end
 
-    if ENV['RACK_ENV'] != 'production' || ENV['SERVE_ASSETS']
+    if ENV['RACK_ENV'] != 'production' || ENV['SERVE_ASSETS'] || ENV['ADMIN_ASSET_MANIFEST']
       get '/assets/*' do
-        new_env = env.clone
-        new_env["PATH_INFO"].gsub!("/assets", "")
-        assets.call(new_env)
+        asset = params[:splat].first
+        path = "./public/assets/#{asset}"
+        if File.exists?(path)
+          content_type = case asset.split('.').last
+                         when 'css'
+                           'text/css'
+                         when 'js'
+                           'application/javascript'
+                         end
+          headers = { 'Content-Type' => content_type } if content_type
+          [200, headers, [File.read(path)]]
+        else
+          if ENV['RACK_ENV'] != 'production' || ENV['SERVE_ASSETS']
+            new_env = env.clone
+            new_env["PATH_INFO"].gsub!("/assets", "")
+            settings.assets.call(new_env)
+          else
+            halt 404
+          end
+        end
       end
     end
 
     get '/' do
       authenticate!
       @profile = tent_client.profile.get.body
-      @profile['https://tent.io/types/info/basic/v0.1.0'] ||= {
-        'public' => true,
-        'name' => '',
-        'avatar_url' => '',
-        'birthdate' => '',
-        'location' => '',
-        'gender' => '',
-        'bio' => ''
-      }
+      @profile[basic_profile_uri] ||= {}
+
+      %w( name avatar_url birthdate location gender bio website_url ).each { |k| @profile[basic_profile_uri][k] ||= '' }
+      @profile[basic_profile_uri]['public'] ||= true
+
+      blacklist = %w( tent_version version )
+
+      @profile.each_pair do |type, content|
+        blacklist.each { |k| content.delete(k) }
+      end
 
       @apps = tent_client.app.list.body
       @apps.kind_of?(Array) ? @apps.map! { |a| Hashie::Mash.new(a) } : @apps = []
@@ -137,6 +164,7 @@ module TentD
 
     put '/profile' do
       authenticate!
+      authenticate_csrf!
       params.each_pair do |key, val|
         next unless key =~ %r{tent.io/types/info}
         (val['permissions'] ||= {})['public'] = true
@@ -148,12 +176,14 @@ module TentD
 
     delete '/apps/:app_id' do
       authenticate!
+      authenticate_csrf!
       tent_client.app.delete(params[:app_id])
       redirect full_path('/')
     end
 
     delete '/apps/:app_id/authorizations/:app_auth_id' do
       authenticate!
+      authenticate_csrf!
       tent_client.app.authorization.delete(params[:app_id], params[:app_auth_id])
       redirect full_path('/')
     end
@@ -190,6 +220,8 @@ module TentD
       if @app.authorizations.any?
         authorization = @app.authorizations.last
 
+        session[:auth_id] = authorization.id
+
         unless authorization.notification_url == @app_params.tent_notification_url
           tent_client.app.authorization.update(@app.id, authorization.id, :notification_url => @app_params.notification_url)
         end
@@ -210,8 +242,10 @@ module TentD
 
     post '/oauth/confirm' do
       authenticate!
+      authenticate_csrf!
       @app = Hashie::Mash.new(tent_client.app.get(session.delete(:current_app_id)).body)
       @app_params = Hashie::Mash.new(session.delete(:current_app_params))
+      auth_id = session.delete(:auth_id)
 
       redirect_uri = URI(@app_params.redirect_uri.to_s)
       redirect_uri.query ||= ""
@@ -235,9 +269,20 @@ module TentD
         },
         :notification_url => @app_params.tent_notification_url
       }
-      authorization = Hashie::Mash.new(tent_client.app.authorization.create(@app.id, data).body)
 
-      redirect_uri.query +="code=#{authorization.token_code}"
+      if auth_id
+        res = tent_client.app.authorization.update(@app.id, auth_id, data)
+      else
+        res = tent_client.app.authorization.create(@app.id, data)
+      end
+
+      if res.success?
+        authorization = Hashie::Mash.new(res.body)
+        redirect_uri.query +="code=#{authorization.token_code}"
+      else
+        redirect_uri.query +="&error=access_denied&error_description=unknown"
+      end
+
       redirect_uri.query += "&state=#{@app_params.state}" if @app_params.has_key?(:state)
       redirect redirect_uri.to_s
     end
